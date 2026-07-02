@@ -107,3 +107,7 @@ email----password----client_id----refresh_token
 - 建议使用代理，同一 IP 注册超过 3 个号容易触发风控
 - curl_cffi 需要 TLS 指纹伪装，这是绕过 OpenAI 反爬的关键
 - Team 空间重新登录步骤需要实际 OpenAI 环境调试确认 workspace 选择 API
+
+## 致谢
+
+感谢 [LINUX DO](https://linux.do/) 社区的交流与支持。
