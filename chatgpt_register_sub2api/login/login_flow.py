@@ -23,6 +23,7 @@ inspecting the authorize response. See _select_team_workspace().
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 import uuid
@@ -30,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from chatgpt_register_sub2api.register.headers import navigate_headers
+from chatgpt_register_sub2api.register.headers import json_headers, navigate_headers
 from chatgpt_register_sub2api.register.mail_provider import wait_for_code
 from chatgpt_register_sub2api.register.session import (
     create_register_session,
@@ -55,6 +56,8 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/145.0.0.0 Safari/537.36"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LoginError(RuntimeError):
@@ -151,15 +154,12 @@ def re_login_for_team_token(
         # Step 2: Handle login path — password verification
         # After authorize with login_hint for existing account,
         # the flow redirects to password verification
-        _handle_password_verification(
+        authorization_code = _handle_password_verification(
             session, device_id, email, password,
-            proxy, flaresolverr_url,
+            mail_config, proxy, flaresolverr_url,
         )
 
-        # Step 3: OTP verification (always required for new IP/device)
-        _handle_login_otp(session, device_id, email, mail_config)
-
-        # Step 4: Workspace selection
+        # Step 3: Workspace selection
         # If the account has multiple workspaces (personal + team),
         # we need to select the team workspace.
         _select_team_workspace(
@@ -167,9 +167,11 @@ def re_login_for_team_token(
             proxy, flaresolverr_url,
         )
 
-        # Step 5: Exchange code for tokens
+        # Step 4: Exchange code for tokens
         tokens = _exchange_login_tokens(
-            session, code_verifier, proxy, flaresolverr_url
+            session=session,
+            code_verifier=code_verifier,
+            authorization_code=authorization_code,
         )
 
         return {
@@ -191,33 +193,45 @@ def _handle_password_verification(
     device_id: str,
     email: str,
     password: str,
+    mail_config: dict,
     proxy: str,
     flaresolverr_url: str,
-) -> None:
+) -> str:
     """Submit password during login flow.
 
-    The password verification endpoint may vary. We try the standard
-    Auth0 password verification API at /api/accounts/user/login.
+    Returns the authorization code from the password verification
+    continue_url. This matches the current browser flow used by the
+    upstream chatgpt2api implementation.
     """
-    url = f"{AUTH_BASE}/api/accounts/user/login"
+    url = f"{AUTH_BASE}/api/accounts/password/verify"
     headers = {
         "accept": "application/json",
-        "accept-language": "en-US,en;q=0.9",
+        "accept-language": "zh-CN,zh;q=0.9",
         "content-type": "application/json",
-        "oai-device-id": device_id,
         "origin": AUTH_BASE,
-        "referer": f"{AUTH_BASE}/log-in",
+        "priority": "u=1, i",
         "user-agent": USER_AGENT,
+        "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "referer": f"{AUTH_BASE}/email-verification",
+        "oai-device-id": device_id,
     }
-    sentinel_token, _ = build_sentinel_token(
+    sentinel_token, oai_sc_value = build_sentinel_token(
         session, device_id, "password_verify",
         user_agent=USER_AGENT,
     )
     headers["openai-sentinel-token"] = sentinel_token
+    if oai_sc_value and hasattr(session, "cookies"):
+        session.cookies.set("oai-sc", oai_sc_value, domain=".openai.com")
 
+    otp_not_before = datetime.now(timezone.utc)
     resp, error = request_with_retry(
         session, "post", url,
-        json={"username": email, "password": password},
+        json={"password": password},
         headers=headers, verify=False,
     )
 
@@ -227,10 +241,167 @@ def _handle_password_verification(
         )
     if resp.status_code != 200:
         data = _response_json(resp)
-        detail = data.get("message") or data.get("error") or resp.text[:200]
+        error_data = data.get("error") if isinstance(data.get("error"), dict) else {}
+        error_code = str(error_data.get("code") or "")
+        error_msg = str(error_data.get("message") or data.get("message") or resp.text[:200])
+        if error_code == "unsupported_country_region_territory":
+            detail = "unsupported_country_region_territory"
+        elif error_code == "invalid_state":
+            detail = "invalid_state"
+        elif "Invalid credentials" in error_msg or "wrong password" in error_msg.lower():
+            detail = "invalid_password"
+        else:
+            detail = error_msg
         raise LoginError(
             f"Password verification failed (HTTP {resp.status_code}): {detail}"
         )
+
+    data = _response_json(resp)
+    code = _resolve_authorization_code(session, data, device_id=device_id)
+    if code:
+        return code
+
+    page_info = data.get("page")
+    page_type = str(page_info.get("type") or "") if isinstance(page_info, dict) else ""
+    if page_type == "email_otp_verification":
+        auth_session = str(data.get("oai-client-auth-session") or "").strip()
+        return _handle_login_otp(
+            session,
+            device_id,
+            email,
+            mail_config,
+            auth_session,
+            otp_not_before=otp_not_before,
+        )
+
+    raise LoginError(
+        f"Password verification returned no authorization code. "
+        f"JSON keys={list(data.keys()) if data else 'none'}"
+    )
+
+
+def _extract_authorization_code(data: dict[str, Any]) -> str:
+    continue_url = str(data.get("continue_url") or "").strip()
+    return _extract_authorization_code_from_url(continue_url)
+
+
+def _extract_authorization_code_from_url(url: str) -> str:
+    continue_url = str(url or "").strip()
+    if not continue_url:
+        return ""
+    try:
+        parsed = parse_qs(urlparse(continue_url).query)
+    except Exception:
+        return ""
+    return str((parsed.get("code") or [""])[0]).strip()
+
+
+def _safe_json_summary(data: dict[str, Any]) -> str:
+    if not data:
+        return "json=none"
+    page = data.get("page") if isinstance(data.get("page"), dict) else {}
+    page_type = str(page.get("type") or "") if isinstance(page, dict) else ""
+    continue_url = str(data.get("continue_url") or "")
+    if len(continue_url) > 220:
+        continue_url = continue_url[:220] + "..."
+    method = str(data.get("method") or "")
+    has_auth_session = bool(str(data.get("oai-client-auth-session") or "").strip())
+    return (
+        f"keys={list(data.keys())}, method={method or '-'}, "
+        f"page.type={page_type or '-'}, has_auth_session={has_auth_session}, "
+        f"continue_url={continue_url or '-'}"
+    )
+
+
+def _resolve_authorization_code(
+    session,
+    data: dict[str, Any],
+    *,
+    device_id: str = "",
+    max_hops: int = 5,
+    trace: list[str] | None = None,
+) -> str:
+    """Resolve an authorization code from continue_url, following it if needed."""
+    if trace is not None:
+        trace.append(f"resolve: {_safe_json_summary(data)}")
+
+    code = _extract_authorization_code(data)
+    if code:
+        if trace is not None:
+            trace.append("resolve: found code in continue_url")
+        return code
+    if max_hops <= 0:
+        if trace is not None:
+            trace.append("resolve: max_hops exhausted")
+        return ""
+
+    continue_url = str(data.get("continue_url") or "").strip()
+    if not continue_url:
+        if trace is not None:
+            trace.append("resolve: no continue_url")
+        return ""
+
+    if continue_url.startswith("/"):
+        continue_url = f"{AUTH_BASE}{continue_url}"
+
+    method = str(data.get("method") or "GET").strip().upper() or "GET"
+    auth_session = str(data.get("oai-client-auth-session") or "").strip()
+    headers = navigate_headers(f"{AUTH_BASE}/email-verification")
+    if auth_session:
+        headers["oai-client-auth-session"] = auth_session
+
+    if trace is not None:
+        trace.append(
+            f"follow: method={method}, url={continue_url[:260]}, "
+            f"has_auth_session={bool(auth_session)}"
+        )
+    logger.debug(
+        "Following authorize continue: method=%s url=%s has_auth_session=%s",
+        method,
+        continue_url,
+        bool(auth_session),
+    )
+
+    resp, _ = request_with_retry(
+        session,
+        method,
+        continue_url,
+        headers=headers,
+        allow_redirects=True,
+        verify=False,
+    )
+    if resp is None:
+        if trace is not None:
+            trace.append("follow: no response")
+        return ""
+
+    final_url = str(getattr(resp, "url", "") or "")
+    if trace is not None:
+        trace.append(
+            f"follow: status={getattr(resp, 'status_code', '?')}, "
+            f"final_url={final_url[:260] or '-'}"
+        )
+
+    code = _extract_authorization_code_from_url(final_url)
+    if code:
+        if trace is not None:
+            trace.append("follow: found code in final_url")
+        return code
+
+    try:
+        final_path = urlparse(final_url).path.rstrip("/")
+    except Exception:
+        final_path = ""
+    follow_data = _response_json(resp)
+    if follow_data and follow_data is not data:
+        return _resolve_authorization_code(
+            session,
+            follow_data,
+            device_id=device_id,
+            max_hops=max_hops - 1,
+            trace=trace,
+        )
+    return ""
 
 
 def _handle_login_otp(
@@ -238,41 +409,30 @@ def _handle_login_otp(
     device_id: str,
     email: str,
     mail_config: dict,
-) -> None:
-    """Handle OTP during login flow."""
-    # Send OTP
-    url = f"{AUTH_BASE}/api/accounts/email-otp/send"
-    headers = navigate_headers(f"{AUTH_BASE}/log-in")
-
-    resp, error = request_with_retry(
-        session, "get", url, headers=headers,
-        allow_redirects=True, verify=False,
-    )
-    if resp is None or resp.status_code not in (200, 302):
-        raise LoginError(
-            f"Login OTP send failed: HTTP "
-            f"{getattr(resp, 'status_code', '?')}"
-        )
-
-    # Wait for code (we need a temporary mailbox — use the Outlook pool)
-    # Since we already know the email, we can poll for codes on that mailbox
-    code = wait_for_code(mail_config, {
+    auth_session: str = "",
+    otp_not_before: datetime | None = None,
+) -> str:
+    """Handle OTP during login flow and return the authorization code."""
+    mailbox = {
         "provider": "outlook_token",
         "provider_ref": "",
         "address": email,
-    })
+        "subject_include": "login code",
+        "_code_not_before": otp_not_before or datetime.now(timezone.utc),
+    }
+
+    # Wait for code (we need a temporary mailbox — use the Outlook pool)
+    # Since we already know the email, we can poll for codes on that mailbox
+    logger.debug("[%s] Waiting for login OTP from mailbox: %s", email, mailbox["address"])
+    code = wait_for_code(mail_config, mailbox)
     if not code:
         raise LoginError("Timed out waiting for login OTP code")
+    logger.debug("[%s] Login OTP code read from mailbox: %s", email, code)
 
     # Validate OTP
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "oai-device-id": device_id,
-        "origin": AUTH_BASE,
-        "referer": f"{AUTH_BASE}/email-verification",
-        "user-agent": USER_AGENT,
-    }
+    headers = json_headers(f"{AUTH_BASE}/email-verification", device_id)
+    if auth_session:
+        headers["oai-client-auth-session"] = auth_session
 
     resp, error = request_with_retry(
         session, "post",
@@ -294,10 +454,27 @@ def _handle_login_otp(
             headers=headers, verify=False,
         )
         if resp is None or resp.status_code != 200:
+            body = ""
+            try:
+                body = (resp.text or "")[:300] if resp is not None else ""
+            except Exception:
+                pass
             raise LoginError(
                 f"Login OTP validation failed: HTTP "
-                f"{getattr(resp, 'status_code', '?')}"
+                f"{getattr(resp, 'status_code', '?')}, body={body}"
             )
+
+    data = _response_json(resp)
+    trace: list[str] = []
+    auth_code = _resolve_authorization_code(session, data, device_id=device_id, trace=trace)
+    if auth_code:
+        return auth_code
+
+    raise LoginError(
+        f"Login OTP validation returned no authorization code. "
+        f"JSON keys={list(data.keys()) if data else 'none'}. "
+        f"Trace: {' | '.join(trace) if trace else 'none'}"
+    )
 
 
 def _select_team_workspace(
@@ -366,15 +543,9 @@ def _select_team_workspace(
 def _exchange_login_tokens(
     session,
     code_verifier: str,
-    proxy: str = "",
-    flaresolverr_url: str = "",
+    authorization_code: str,
 ) -> dict:
-    """Exchange authorization code for tokens after login flow completes.
-
-    After the login + workspace selection flow, the session should have
-    been redirected to the platform callback with a code parameter.
-    We extract this code and exchange it for tokens.
-    """
+    """Exchange authorization code for tokens after login flow completes."""
     headers = {
         "accept": "*/*",
         "accept-language": "zh-CN,zh;q=0.9",
@@ -394,63 +565,9 @@ def _exchange_login_tokens(
         "user-agent": USER_AGENT,
     }
 
-    # At this point, the session should have been through the full
-    # authorize → login → OTP → workspace select → callback flow.
-    # The last response URL should contain the code.
-    #
-    # However, since we're driving this programmatically, we may need
-    # to:
-    # 1. Check the current session state for the authorization code
-    # 2. Or re-initiate the authorize flow targeting the team workspace
-
-    # For the initial implementation, we re-run authorize with the
-    # workspace context and extract the code from the callback.
-
-    code_verifier_final, code_challenge = generate_pkce()
-
-    params = {
-        "issuer": AUTH_BASE,
-        "client_id": PLATFORM_OAUTH_CLIENT_ID,
-        "audience": PLATFORM_OAUTH_AUDIENCE,
-        "redirect_uri": PLATFORM_OAUTH_REDIRECT_URI,
-        "device_id": str(uuid.uuid4()),
-        "screen_hint": "login",
-        "max_age": "0",
-        "scope": "openid profile email offline_access",
-        "response_type": "code",
-        "response_mode": "query",
-        "state": secrets.token_urlsafe(32),
-        "nonce": secrets.token_urlsafe(32),
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-        "auth0Client": PLATFORM_AUTH0_CLIENT,
-    }
-    auth_url = f"{AUTH_BASE}/api/accounts/authorize?{urlencode(params)}"
-
-    resp, error = request_with_retry(
-        session, "get", auth_url,
-        headers=navigate_headers(f"{PLATFORM_BASE}/"),
-        allow_redirects=True, verify=False,
-    )
-
-    if resp is None:
-        raise LoginError(f"Final authorize failed: {error or 'no response'}")
-
-    final_url = str(getattr(resp, "url", "") or "")
-    try:
-        parsed = parse_qs(urlparse(final_url).query)
-    except Exception:
-        raise LoginError(f"Cannot parse callback URL: {final_url[:200]}")
-
-    code = str((parsed.get("code") or [""])[0]).strip()
+    code = str(authorization_code or "").strip()
     if not code:
-        # Dump debug info
-        data = _response_json(resp)
-        raise LoginError(
-            f"No authorization code in callback. "
-            f"URL={final_url[:300]}, "
-            f"JSON keys={list(data.keys()) if data else 'none'}"
-        )
+        raise LoginError("Token exchange requires an authorization code")
 
     # Exchange code for tokens
     resp = session.post(

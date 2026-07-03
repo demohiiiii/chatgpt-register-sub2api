@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import imaplib
 import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ from threading import Lock
 from typing import Any, Callable
 
 from curl_cffi import requests
+
+logger = logging.getLogger(__name__)
 
 # ── Data directory (stores pool state) ─────────────────────────────
 
@@ -659,11 +662,24 @@ class OutlookTokenProvider(BaseMailProvider):
                 # Skip messages from before the code boundary
                 if _message_before_code_boundary(mailbox, message):
                     continue
+                subject_include = str(mailbox.get("subject_include") or "").strip().lower()
+                if subject_include and subject_include not in str(message.get("subject") or "").lower():
+                    continue
                 ref = _message_tracking_ref(message)
                 if ref in seen_refs:
                     continue
                 code = _extract_code(message)
                 if code:
+                    logger.debug(
+                        "Verification code candidate from mailbox=%s "
+                        "credential_email=%s subject=%s sender=%s received_at=%s code=%s",
+                        mailbox.get("address", ""),
+                        mailbox.get("_credential_email", ""),
+                        message.get("subject", ""),
+                        message.get("sender", ""),
+                        message.get("received_at", ""),
+                        code,
+                    )
                     seen_value.append(ref)
                     return code
                 seen_refs.add(ref)
@@ -730,11 +746,42 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
         else []
     )
     provider_ref = str(mailbox.get("provider_ref") or "")
-    # Try matching by provider_ref first, then fall back to any outlook_token
+    address = str(mailbox.get("address") or "").strip().lower()
+
+    # Try matching by provider_ref first, then by mailbox address. When a
+    # concrete address is supplied without credentials, do not fall back to a
+    # different mailbox: that would read the wrong inbox and can return an old
+    # or unrelated OTP.
     entry = next(
         (item for item in providers if item.get("provider_ref") == provider_ref),
         None,
     )
+    matched_address = False
+    if entry is None and address:
+        entry = next(
+            (
+                item
+                for item in providers
+                if item.get("type") == "outlook_token"
+                and item.get("enable", True)
+                and any(
+                    str(credential.get("email") or "").strip().lower() == address
+                    for credential in parse_outlook_credentials(
+                        str(item.get("mailboxes") or item.get("pool") or "")
+                    )
+                )
+            ),
+            None,
+        )
+        matched_address = entry is not None
+    if (
+        address
+        and not matched_address
+        and not (mailbox.get("client_id") and mailbox.get("refresh_token"))
+    ):
+        raise RuntimeError(
+            f"No outlook_token mailbox credentials found for {address}"
+        )
     if entry is None:
         entry = next(
             (item for item in providers
@@ -748,9 +795,39 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
     conf = _make_config(mail_config)
     provider = OutlookTokenProvider(entry, conf)
     try:
+        matched_email = _populate_mailbox_credentials(mailbox, entry)
+        if matched_email:
+            logger.debug(
+                "Using OutlookToken credentials for mailbox address=%s credential_email=%s",
+                mailbox.get("address", ""),
+                matched_email,
+            )
         return provider.wait_for_code(mailbox)
     finally:
         provider.close()
+
+
+def _populate_mailbox_credentials(mailbox: dict, entry: dict) -> str:
+    """Fill client_id/refresh_token for an existing mailbox from provider config."""
+    if mailbox.get("client_id") and mailbox.get("refresh_token"):
+        return str(mailbox.get("_credential_email") or mailbox.get("address") or "")
+
+    address = str(mailbox.get("address") or "").strip().lower()
+    if not address:
+        return ""
+
+    for credential in parse_outlook_credentials(
+        str(entry.get("mailboxes") or entry.get("pool") or "")
+    ):
+        credential_email = str(credential.get("email") or "").strip()
+        if credential_email.lower() != address:
+            continue
+        mailbox.setdefault("client_id", credential.get("client_id", ""))
+        mailbox.setdefault("refresh_token", credential.get("refresh_token", ""))
+        mailbox.setdefault("label", str(entry.get("label") or ""))
+        mailbox["_credential_email"] = credential_email
+        return credential_email
+    return ""
 
 
 def mark_mailbox_result(

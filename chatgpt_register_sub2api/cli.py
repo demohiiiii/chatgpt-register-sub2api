@@ -5,6 +5,7 @@ Subcommands:
   register         Register N ChatGPT accounts
   join-workspace   Join registered accounts to K12 workspace
   login-team       Re-login with Team space selection
+  login-export     Login selected existing accounts and export sub2api JSON
   export           Export to sub2api JSON
   run              Full pipeline (register → join → login → export)
 """
@@ -27,6 +28,7 @@ from chatgpt_register_sub2api.pipeline import (
     run_export,
     run_full_pipeline,
     run_join_workspace,
+    run_login_export,
     run_re_login,
     run_register,
     save_accounts,
@@ -168,6 +170,45 @@ def cmd_export(args) -> int:
     return 0
 
 
+def cmd_login_export(args) -> int:
+    """Login selected existing accounts and export successful logins."""
+    config = load_config(args.config)
+    setup_logging(config, args.verbose)
+
+    accounts_file = Path(args.accounts) if args.accounts else Path("registered_accounts.json")
+    output_file = Path(args.output) if args.output else None
+
+    summary = run_login_export(
+        config=config,
+        emails=args.emails,
+        output_file=output_file,
+        accounts_file=accounts_file,
+    )
+
+    print(f"\nLogin-export summary:")
+    print(f"  Requested: {len(summary['requested'])}")
+    print(f"  Succeeded: {len(summary['succeeded'])}")
+    print(f"  Exported:  {summary['exported']}")
+    print(f"  Output:    {summary['output_file']}")
+
+    if summary["missing"]:
+        print("  Not found:")
+        for email in summary["missing"]:
+            print(f"    - {email}")
+
+    if summary["missing_password"]:
+        print("  Missing password:")
+        for email in summary["missing_password"]:
+            print(f"    - {email}")
+
+    if summary["failed"]:
+        print("  Login failed:")
+        for item in summary["failed"]:
+            print(f"    - {item['email']}: {item['error']}")
+
+    return 0 if summary["exported"] > 0 else 1
+
+
 def cmd_run(args) -> int:
     """Run the full pipeline."""
     config = load_config(args.config)
@@ -240,6 +281,22 @@ def main(argv: list[str] | None = None) -> None:
     p_export.add_argument("--input", "-i", default=None, help="Input accounts JSON")
     p_export.add_argument("--stdout", action="store_true", help="Print to stdout")
     p_export.set_defaults(func=cmd_export)
+
+    # ── login-export ──
+    p_login_export = sub.add_parser(
+        "login-export",
+        help="Login selected existing accounts and export sub2api JSON",
+    )
+    p_login_export.add_argument("emails", nargs="+", help="Email address to login and export")
+    p_login_export.add_argument("--config", "-c", default=None, help="Config file path")
+    p_login_export.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    p_login_export.add_argument("--output", "-o", default=None, help="Output sub2api JSON file")
+    p_login_export.add_argument(
+        "--accounts",
+        default=None,
+        help="Accounts store JSON file (default: ./registered_accounts.json)",
+    )
+    p_login_export.set_defaults(func=cmd_login_export)
 
     # ── run ──
     p_run = sub.add_parser("run", help="Full pipeline")

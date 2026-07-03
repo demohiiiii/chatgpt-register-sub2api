@@ -39,8 +39,19 @@ chatgpt-register run -n 10 -v
 | `register` | 只注册 ChatGPT 账号 |
 | `join-workspace` | 只执行 workspace 加入 |
 | `login-team` | 只执行重新登录（team 空间） |
+| `login-export` | 用已有账号重新登录，并只导出登录成功账号 |
 | `export` | 只导出 sub2api JSON |
 | `run` | 完整流水线（上面四步串行） |
+
+### 已有账号登录并导出
+
+`login-export` 从当前目录的 `registered_accounts.json` 读取账号密码，命令行直接传入要处理的邮箱：
+
+```bash
+chatgpt-register login-export user1@example.com user2@example.com
+```
+
+找不到账号、缺少密码或登录失败的邮箱会被提示并跳过，不会使用旧 token 兜底导出。
 
 ## 完整流水线
 
