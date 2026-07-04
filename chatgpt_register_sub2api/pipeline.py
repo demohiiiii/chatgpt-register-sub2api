@@ -276,8 +276,10 @@ def run_refresh_tokens(
         email = account.get("email", "")
         rt = account.get("refresh_token", "")
 
-        if not rt:
-            logger.warning(f"[{email}] No refresh_token — skipping refresh")
+        if not rt and _workspace_session_matches(account, workspace_id):
+            logger.info(
+                f"[{email}] Already using target workspace session — skipping token refresh/check"
+            )
             continue
 
         session = None
@@ -289,29 +291,34 @@ def run_refresh_tokens(
             session = requests.Session(**kwargs)
 
             # Step 1: Refresh the access token
-            resp = session.post(
-                "https://auth.openai.com/oauth/token",
-                data={
-                    "client_id": "app_2SKx67EdpoN0G6j64rFvigXD",
-                    "grant_type": "refresh_token",
-                    "refresh_token": rt,
-                },
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                new_at = data.get("access_token", "")
-                new_rt = data.get("refresh_token", "")
-                if new_at:
-                    account["access_token"] = new_at
-                if new_rt:
-                    account["refresh_token"] = new_rt
-                logger.info(f"[{email}] Token refreshed")
+            if rt:
+                resp = session.post(
+                    "https://auth.openai.com/oauth/token",
+                    data={
+                        "client_id": "app_2SKx67EdpoN0G6j64rFvigXD",
+                        "grant_type": "refresh_token",
+                        "refresh_token": rt,
+                    },
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    new_at = data.get("access_token", "")
+                    new_rt = data.get("refresh_token", "")
+                    if new_at:
+                        account["access_token"] = new_at
+                    if new_rt:
+                        account["refresh_token"] = new_rt
+                    logger.info(f"[{email}] Token refreshed")
+                else:
+                    logger.warning(f"[{email}] Token refresh failed: HTTP {resp.status_code}")
             else:
-                logger.warning(f"[{email}] Token refresh failed: HTTP {resp.status_code}")
+                logger.info(
+                    f"[{email}] No refresh_token — skipping token refresh, checking current access_token"
+                )
 
             # Step 2: Call check API to get real plan_type and account_id
             at = account.get("access_token", "")
@@ -366,7 +373,31 @@ def run_export(
     # Prepare accounts for export — use registration tokens directly
     # (Team-scoped tokens would require browser-based re-login, not yet implemented)
     export_accounts = []
+    workspace_ids = _configured_workspace_ids(config)
+    multi_workspace_export = len(workspace_ids) > 1
     for account in accounts:
+        workspace_tokens = account.get("workspace_tokens")
+        if workspace_ids and isinstance(workspace_tokens, dict):
+            exported_workspace_token = False
+            for workspace_id in workspace_ids:
+                token_record = workspace_tokens.get(workspace_id)
+                if not isinstance(token_record, dict):
+                    continue
+                export = dict(account)
+                export.update(token_record)
+                export["workspace_id"] = workspace_id
+                export["source_type"] = str(
+                    token_record.get("source_type")
+                    or account.get("source_type")
+                    or "workspace_tokens"
+                )
+                if multi_workspace_export:
+                    export["multi_workspace_export"] = True
+                export_accounts.append(export)
+                exported_workspace_token = True
+            if exported_workspace_token:
+                continue
+
         export = dict(account)
         if account.get("team_login_status") == "ok":
             export["access_token"] = account.get("team_access_token", account.get("access_token", ""))
@@ -387,6 +418,247 @@ def run_export(
 
 def _normalize_email(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _login_default_password(config: dict[str, Any]) -> str:
+    login_cfg = config.get("login", {})
+    if isinstance(login_cfg, dict):
+        password = str(login_cfg.get("password") or "").strip()
+        if password:
+            return password
+    return ""
+
+
+def _login_mode(config: dict[str, Any]) -> str:
+    login_cfg = config.get("login", {})
+    if isinstance(login_cfg, dict):
+        mode = str(login_cfg.get("mode") or "password").strip().lower()
+        if mode in {"password", "otp"}:
+            return mode
+    return "password"
+
+
+def _configured_workspace_ids(config: dict[str, Any]) -> list[str]:
+    ws_cfg = config.get("workspace", {})
+    raw_ids = ws_cfg.get("ids", []) if isinstance(ws_cfg, dict) else []
+    if isinstance(raw_ids, str):
+        raw_values = [raw_ids]
+    elif isinstance(raw_ids, (list, tuple)):
+        raw_values = list(raw_ids)
+    else:
+        raw_values = []
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        workspace_id = str(value or "").strip()
+        if workspace_id and workspace_id not in seen:
+            result.append(workspace_id)
+            seen.add(workspace_id)
+    return result
+
+
+def _login_workspace_targets(config: dict[str, Any]) -> list[str]:
+    workspace_ids = _configured_workspace_ids(config)
+    return workspace_ids if workspace_ids else [""]
+
+
+def _config_for_workspace(config: dict[str, Any], workspace_id: str) -> dict[str, Any]:
+    scoped = dict(config)
+    ws_cfg = dict(config.get("workspace", {}) or {})
+    ws_cfg["ids"] = [workspace_id] if workspace_id else []
+    scoped["workspace"] = ws_cfg
+    return scoped
+
+
+def _workspace_groups(accounts: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for account in accounts:
+        workspace_id = str(account.get("workspace_id") or "").strip()
+        groups.setdefault(workspace_id, []).append(account)
+    return groups
+
+
+def _remember_workspace_tokens(
+    account: dict[str, Any],
+    source: dict[str, Any],
+    workspace_id: str,
+) -> None:
+    workspace_id = str(workspace_id or "").strip()
+    if not workspace_id:
+        return
+
+    workspace_tokens = account.get("workspace_tokens")
+    if not isinstance(workspace_tokens, dict):
+        workspace_tokens = {}
+        account["workspace_tokens"] = workspace_tokens
+
+    fields = [
+        "email",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "session_token",
+        "chatgpt_account_id",
+        "chatgpt_user_id",
+        "plan_type",
+        "organization_id",
+        "account_user_role",
+        "join_status",
+        "join_results",
+        "source_type",
+        "updated_at",
+    ]
+    workspace_tokens[workspace_id] = {
+        key: source.get(key)
+        for key in fields
+        if key in source
+    }
+    workspace_tokens[workspace_id]["workspace_id"] = workspace_id
+
+
+def _apply_login_tokens(
+    account: dict[str, Any],
+    tokens: dict[str, Any],
+    *,
+    status_key: str,
+    source_type: str,
+    workspace_id: str,
+) -> None:
+    account["access_token"] = str(tokens.get("access_token") or "").strip()
+    account["refresh_token"] = str(tokens.get("refresh_token") or "").strip()
+    account["id_token"] = str(tokens.get("id_token") or "").strip()
+    account["session_token"] = str(tokens.get("session_token") or "").strip()
+    account["chatgpt_account_id"] = str(tokens.get("chatgpt_account_id") or "").strip()
+    account["plan_type"] = str(
+        tokens.get("plan_type") or account.get("plan_type") or ""
+    ).strip()
+    account["organization_id"] = str(
+        tokens.get("organization_id") or account.get("organization_id") or ""
+    ).strip()
+    if tokens.get("chatgpt_user_id"):
+        account["chatgpt_user_id"] = str(tokens.get("chatgpt_user_id") or "").strip()
+    if tokens.get("account_user_role"):
+        account["account_user_role"] = str(tokens.get("account_user_role") or "").strip()
+
+    workspace_id = str(workspace_id or "").strip()
+    if workspace_id:
+        account["workspace_id"] = workspace_id
+    else:
+        account.pop("workspace_id", None)
+
+    account[status_key] = "ok"
+    account.pop(f"{status_key}_error", None)
+    account["source_type"] = source_type
+    account["updated_at"] = _now()
+    _remember_workspace_tokens(account, account, workspace_id)
+
+
+def _export_snapshot(
+    account: dict[str, Any],
+    *,
+    source_type: str,
+    workspace_id: str,
+    multi_workspace_export: bool = False,
+) -> dict[str, Any]:
+    export = dict(account)
+    workspace_id = str(workspace_id or "").strip()
+    if workspace_id:
+        workspace_tokens = account.get("workspace_tokens")
+        if isinstance(workspace_tokens, dict):
+            token_record = workspace_tokens.get(workspace_id)
+            if isinstance(token_record, dict):
+                export.update(token_record)
+        export["workspace_id"] = workspace_id
+    else:
+        export.pop("workspace_id", None)
+    export["source_type"] = source_type
+    if multi_workspace_export:
+        export["multi_workspace_export"] = True
+    else:
+        export.pop("multi_workspace_export", None)
+    return export
+
+
+def _sync_workspace_snapshots_to_accounts(
+    by_email: dict[str, dict[str, Any]],
+    snapshots: list[dict[str, Any]],
+) -> None:
+    for snapshot in snapshots:
+        account = by_email.get(_normalize_email(snapshot.get("email")))
+        if not account:
+            continue
+
+        for key in [
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "session_token",
+            "chatgpt_account_id",
+            "chatgpt_user_id",
+            "plan_type",
+            "organization_id",
+            "account_user_role",
+            "workspace_id",
+            "join_status",
+            "join_results",
+            "source_type",
+            "updated_at",
+        ]:
+            if key in snapshot:
+                account[key] = snapshot[key]
+        _remember_workspace_tokens(
+            account,
+            snapshot,
+            str(snapshot.get("workspace_id") or "").strip(),
+        )
+
+
+def _account_for_login(
+    *,
+    config: dict[str, Any],
+    accounts: list[dict[str, Any]],
+    by_email: dict[str, dict[str, Any]],
+    email: str,
+) -> tuple[dict[str, Any] | None, str, str]:
+    """Return account, password, and failure reason for a login email."""
+    login_mode = _login_mode(config)
+    account = by_email.get(email)
+    if account:
+        if login_mode == "otp":
+            return account, str(account.get("password") or "").strip(), ""
+        password = str(account.get("password") or "").strip()
+        if password:
+            return account, password, ""
+        password = _login_default_password(config)
+        if password:
+            account["password"] = password
+            return account, password, ""
+        return account, "", "missing_password"
+
+    password = "" if login_mode == "otp" else _login_default_password(config)
+    if not password:
+        if login_mode != "otp":
+            return None, "", "missing"
+
+    account = {
+        "email": email,
+        "password": password,
+        "source_type": "login_input",
+        "created_at": _now(),
+    }
+    accounts.append(account)
+    by_email[email] = account
+    return account, password, ""
+
+
+def _workspace_session_matches(account: dict[str, Any], workspace_id: str) -> bool:
+    workspace_id = str(workspace_id or "").strip()
+    if not workspace_id:
+        return False
+    account_id = str(account.get("chatgpt_account_id") or "").strip()
+    plan_type = str(account.get("plan_type") or "").strip().lower()
+    return account_id == workspace_id and plan_type == "k12"
 
 
 def run_login_export(
@@ -420,8 +692,9 @@ def run_login_export(
     proxy_cfg = config.get("proxy", {})
     proxy = str(proxy_cfg.get("url", "")).strip()
     flaresolverr_url = str(proxy_cfg.get("flaresolverr_url", "")).strip()
-    workspace_ids = config.get("workspace", {}).get("ids", [])
-    workspace_id = workspace_ids[0] if workspace_ids else ""
+    workspace_targets = _login_workspace_targets(config)
+    include_workspace_in_status = len([ws for ws in workspace_targets if ws]) > 1
+    login_mode = _login_mode(config)
 
     export_accounts: list[dict[str, Any]] = []
     succeeded: list[str] = []
@@ -432,49 +705,88 @@ def run_login_export(
     logger.info(f"Login-export started for {len(requested)} account(s)")
 
     for email in requested:
-        account = by_email.get(email)
-        if not account:
+        account, password, reason = _account_for_login(
+            config=config,
+            accounts=accounts,
+            by_email=by_email,
+            email=email,
+        )
+        if reason == "missing":
             missing.append(email)
             logger.warning(f"[{email}] Not found in {af}")
             continue
-
-        password = str(account.get("password") or "")
-        if not password:
+        if account is None:
+            missing.append(email)
+            logger.warning(f"[{email}] Not found in {af}")
+            continue
+        if reason == "missing_password":
             account["login_export_status"] = "missing_password"
             missing_password.append(email)
             logger.warning(f"[{email}] Missing password — skipping")
             continue
 
-        try:
-            tokens = re_login_for_team_token(
-                email=str(account.get("email") or email),
-                password=password,
-                mail_config=mail_cfg,
-                proxy=proxy,
-                flaresolverr_url=flaresolverr_url,
+        email_succeeded = False
+        for workspace_id in workspace_targets:
+            try:
+                tokens = re_login_for_team_token(
+                    email=str(account.get("email") or email),
+                    password=password,
+                    mail_config=mail_cfg,
+                    proxy=proxy,
+                    flaresolverr_url=flaresolverr_url,
+                    workspace_id=workspace_id,
+                    login_mode=login_mode,
+                )
+            except Exception as e:
+                error = str(e)
+                account["login_export_status"] = "failed"
+                account["login_export_error"] = error
+                failure = {"email": email, "error": error}
+                if include_workspace_in_status and workspace_id:
+                    failure["workspace_id"] = workspace_id
+                failed.append(failure)
+                workspace_note = f" workspace={workspace_id}" if workspace_id else ""
+                logger.warning(f"[{email}] Login failed{workspace_note}: {error}")
+                continue
+
+            _apply_login_tokens(
+                account,
+                tokens,
+                status_key="login_export_status",
+                source_type="login_export",
                 workspace_id=workspace_id,
             )
-        except Exception as e:
-            error = str(e)
-            account["login_export_status"] = "failed"
-            account["login_export_error"] = error
-            failed.append({"email": email, "error": error})
-            logger.warning(f"[{email}] Login failed: {error}")
-            continue
-
-        account["access_token"] = str(tokens.get("access_token") or "").strip()
-        account["refresh_token"] = str(tokens.get("refresh_token") or "").strip()
-        account["id_token"] = str(tokens.get("id_token") or "").strip()
-        account["login_export_status"] = "ok"
-        account.pop("login_export_error", None)
-        account["source_type"] = "login_export"
-        account["updated_at"] = _now()
-
-        export_accounts.append(dict(account))
-        succeeded.append(email)
-        logger.info(f"[{email}] Login successful")
+            account.pop("login_export_error", None)
+            export_accounts.append(
+                _export_snapshot(
+                    account,
+                    source_type="login_export",
+                    workspace_id=workspace_id,
+                    multi_workspace_export=include_workspace_in_status,
+                )
+            )
+            if not email_succeeded:
+                succeeded.append(email)
+                email_succeeded = True
+            workspace_note = f" workspace={workspace_id}" if workspace_id else ""
+            logger.info(f"[{email}] Login successful{workspace_note}")
+        if email_succeeded and account.get("login_export_status") == "failed":
+            account["login_export_status"] = "partial"
 
     save_accounts(af, accounts)
+
+    if not export_accounts:
+        logger.warning("Login-export had 0 successful account(s); skipping sub2api export")
+        return {
+            "requested": requested,
+            "succeeded": succeeded,
+            "missing": missing,
+            "missing_password": missing_password,
+            "failed": failed,
+            "exported": 0,
+            "accounts_file": str(af.resolve()),
+            "output_file": "",
+        }
 
     output_path = Path(output_file) if output_file else Path(
         config.get("_config_dir", ".")
@@ -526,8 +838,9 @@ def run_login_join_export(
     proxy_cfg = config.get("proxy", {})
     proxy = str(proxy_cfg.get("url", "")).strip()
     flaresolverr_url = str(proxy_cfg.get("flaresolverr_url", "")).strip()
-    workspace_ids = config.get("workspace", {}).get("ids", [])
-    workspace_id = workspace_ids[0] if workspace_ids else ""
+    workspace_targets = _login_workspace_targets(config)
+    include_workspace_in_status = len([ws for ws in workspace_targets if ws]) > 1
+    login_mode = _login_mode(config)
 
     successful_accounts: list[dict[str, Any]] = []
     succeeded: list[str] = []
@@ -538,55 +851,123 @@ def run_login_join_export(
     logger.info(f"Login-join-export started for {len(requested)} account(s)")
 
     for email in requested:
-        account = by_email.get(email)
-        if not account:
+        account, password, reason = _account_for_login(
+            config=config,
+            accounts=accounts,
+            by_email=by_email,
+            email=email,
+        )
+        if reason == "missing":
             missing.append(email)
             logger.warning(f"[{email}] Not found in {af}")
             continue
-
-        password = str(account.get("password") or "")
-        if not password:
+        if account is None:
+            missing.append(email)
+            logger.warning(f"[{email}] Not found in {af}")
+            continue
+        if reason == "missing_password":
             account["login_join_export_status"] = "missing_password"
             missing_password.append(email)
             logger.warning(f"[{email}] Missing password — skipping")
             continue
 
-        try:
-            tokens = re_login_for_team_token(
-                email=str(account.get("email") or email),
-                password=password,
-                mail_config=mail_cfg,
-                proxy=proxy,
-                flaresolverr_url=flaresolverr_url,
+        email_succeeded = False
+        for workspace_id in workspace_targets:
+            try:
+                tokens = re_login_for_team_token(
+                    email=str(account.get("email") or email),
+                    password=password,
+                    mail_config=mail_cfg,
+                    proxy=proxy,
+                    flaresolverr_url=flaresolverr_url,
+                    workspace_id=workspace_id,
+                    login_mode=login_mode,
+                )
+            except Exception as e:
+                error = str(e)
+                account["login_join_export_status"] = "failed"
+                account["login_join_export_error"] = error
+                failure = {"email": email, "error": error}
+                if include_workspace_in_status and workspace_id:
+                    failure["workspace_id"] = workspace_id
+                failed.append(failure)
+                workspace_note = f" workspace={workspace_id}" if workspace_id else ""
+                logger.warning(f"[{email}] Login failed{workspace_note}: {error}")
+                continue
+
+            _apply_login_tokens(
+                account,
+                tokens,
+                status_key="login_join_export_status",
+                source_type="login_join_export",
                 workspace_id=workspace_id,
             )
-        except Exception as e:
-            error = str(e)
-            account["login_join_export_status"] = "failed"
-            account["login_join_export_error"] = error
-            failed.append({"email": email, "error": error})
-            logger.warning(f"[{email}] Login failed: {error}")
-            continue
+            account.pop("login_join_export_error", None)
+            export_account = _export_snapshot(
+                account,
+                source_type="login_join_export",
+                workspace_id=workspace_id,
+                multi_workspace_export=include_workspace_in_status,
+            )
+            if _workspace_session_matches(export_account, workspace_id):
+                export_account["join_status"] = "ok"
+                export_account["join_results"] = [
+                    {
+                        "ok": True,
+                        "status_code": 200,
+                        "workspace_id": workspace_id,
+                        "body": "already switched by login session",
+                    }
+                ]
+                _remember_workspace_tokens(account, export_account, workspace_id)
 
-        account["access_token"] = str(tokens.get("access_token") or "").strip()
-        account["refresh_token"] = str(tokens.get("refresh_token") or "").strip()
-        account["id_token"] = str(tokens.get("id_token") or "").strip()
-        account["login_join_export_status"] = "ok"
-        account.pop("login_join_export_error", None)
-        account["source_type"] = "login_join_export"
-        account["updated_at"] = _now()
-
-        successful_accounts.append(account)
-        succeeded.append(email)
-        logger.info(f"[{email}] Login successful")
+            successful_accounts.append(export_account)
+            if not email_succeeded:
+                succeeded.append(email)
+                email_succeeded = True
+            workspace_note = f" workspace={workspace_id}" if workspace_id else ""
+            logger.info(f"[{email}] Login successful{workspace_note}")
+        if email_succeeded and account.get("login_join_export_status") == "failed":
+            account["login_join_export_status"] = "partial"
 
     save_accounts(af, accounts)
 
     if successful_accounts:
-        run_join_workspace(config, successful_accounts)
+        pending_join_accounts = [
+            account for account in successful_accounts
+            if account.get("join_status") != "ok"
+        ]
+        if pending_join_accounts:
+            for workspace_id, grouped_accounts in _workspace_groups(pending_join_accounts).items():
+                run_join_workspace(
+                    _config_for_workspace(config, workspace_id),
+                    grouped_accounts,
+                )
+        else:
+            logger.info("All successful accounts already use the target workspace session")
         save_accounts(af, accounts)
-        run_refresh_tokens(config, successful_accounts)
+        for workspace_id, grouped_accounts in _workspace_groups(successful_accounts).items():
+            run_refresh_tokens(
+                _config_for_workspace(config, workspace_id),
+                grouped_accounts,
+            )
+        _sync_workspace_snapshots_to_accounts(by_email, successful_accounts)
         save_accounts(af, accounts)
+
+    if not successful_accounts:
+        logger.warning("Login-join-export had 0 successful account(s); skipping sub2api export")
+        return {
+            "requested": requested,
+            "succeeded": succeeded,
+            "missing": missing,
+            "missing_password": missing_password,
+            "failed": failed,
+            "joined": 0,
+            "refreshed": 0,
+            "exported": 0,
+            "accounts_file": str(af.resolve()),
+            "output_file": "",
+        }
 
     output_path = Path(output_file) if output_file else Path(
         config.get("_config_dir", ".")

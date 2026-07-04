@@ -118,15 +118,19 @@ def build_account_entry(
 ) -> dict[str, Any]:
     """Build a single sub2api account entry from an account record."""
     email = str(account.get("email") or "").strip()
+    workspace_id = str(account.get("workspace_id") or "").strip()
     source = str(account.get("source_type") or account.get("source") or "registration")
+    include_workspace_in_name = bool(account.get("multi_workspace_export"))
+    name = f"{email}#{workspace_id}" if include_workspace_in_name and workspace_id else email
 
     return {
-        "name": email,
+        "name": name,
         "platform": "openai",
         "type": "oauth",
         "credentials": build_credentials(account),
         "extra": {
             "email": email,
+            "workspace_id": workspace_id,
             "auth_provider": "chatgpt2api",
             "source": source,
             "openai_oauth_responses_websockets_v2_enabled": False,

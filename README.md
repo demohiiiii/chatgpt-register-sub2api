@@ -23,6 +23,7 @@ chatgpt-register init
 
 # 2. 编辑 config.yaml，填入：
 #    - Outlook 邮箱池（email----password----client_id----refresh_token）
+#      或 Gmail App Password
 #    - 代理地址（可选但推荐）
 #    - K12 workspace ID
 #    详见配置文件内注释
@@ -97,6 +98,15 @@ mail:
       mailboxes: |
         user1@outlook.com----password1----client_id_1----refresh_token_1
         user2@hotmail.com----password2----client_id_2----refresh_token_2
+    - type: gmail
+      enable: false
+      label: Gmail Alias
+      user: your@gmail.com
+      app_password: your_gmail_app_password
+      imap_host: imap.gmail.com
+      imap_port: 993
+      alias_length: 8
+      message_limit: 10
 
 proxy:
   url: "socks5://127.0.0.1:1080"     # 代理（推荐）
@@ -105,6 +115,9 @@ proxy:
 registration:
   threads: 3
   total: 10
+
+login:
+  password: "your_chatgpt_account_password"
 
 workspace:
   enabled: true
@@ -124,6 +137,41 @@ email----password----client_id----refresh_token
 ```
 
 从 Microsoft Azure 应用注册获取 `client_id` 和 `refresh_token`。
+
+## Gmail 邮箱格式
+
+开启 Gmail provider 后，注册流程会自动使用 `user+随机tag@gmail.com` 作为邮箱别名，验证码从 `user` 对应的 Gmail IMAP 收件箱读取：
+
+```yaml
+mail:
+  providers:
+    - type: gmail
+      enable: true
+      user: your@gmail.com
+      app_password: your_gmail_app_password
+```
+
+`app_password` 使用 Gmail 的 App Password。已有账号登录、`login-export` 和 `login-run` 会按账号邮箱自动匹配 Gmail 主账号或 plus alias。
+
+Gmail 账号推荐使用纯邮箱验证码登录，不需要 ChatGPT 密码：
+
+```yaml
+login:
+  mode: otp
+  password: ""
+```
+
+运行：
+
+```bash
+chatgpt-register login-run user+tag@gmail.com -c config.gmail.yaml
+```
+
+如果要临时切回密码模式，可用：
+
+```bash
+chatgpt-register login-run user+tag@gmail.com -c config.gmail.yaml --login-mode password --password "your_chatgpt_account_password"
+```
 
 ## 输出文件
 

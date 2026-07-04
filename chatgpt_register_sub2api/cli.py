@@ -66,6 +66,25 @@ def setup_logging(config: dict, verbose: bool = False) -> None:
         )
 
 
+def apply_login_password_arg(config: dict, args) -> str:
+    """Apply CLI login password options to config.
+
+    Returns the password source: cli, config, or empty.
+    """
+    if getattr(args, "password", None):
+        config.setdefault("login", {})["password"] = args.password
+        return "cli"
+    if str(config.get("login", {}).get("password") or ""):
+        return "config"
+    return ""
+
+
+def apply_login_mode_arg(config: dict, args) -> None:
+    mode = getattr(args, "login_mode", None)
+    if mode:
+        config.setdefault("login", {})["mode"] = mode
+
+
 def cmd_init(args) -> int:
     """Write default config.yaml."""
     path = Path(args.config) if args.config else DEFAULT_CONFIG_FILE
@@ -176,6 +195,11 @@ def cmd_login_export(args) -> int:
     """Login selected existing accounts and export successful logins."""
     config = load_config(args.config)
     setup_logging(config, args.verbose)
+    apply_login_mode_arg(config, args)
+    apply_login_password_arg(config, args)
+
+    if args.workspace_id:
+        config.setdefault("workspace", {})["ids"] = args.workspace_id
 
     accounts_file = Path(args.accounts) if args.accounts else Path("registered_accounts.json")
     output_file = Path(args.output) if args.output else None
@@ -215,6 +239,8 @@ def cmd_login_run(args) -> int:
     """Login selected accounts, join workspace, refresh, and export."""
     config = load_config(args.config)
     setup_logging(config, args.verbose)
+    apply_login_mode_arg(config, args)
+    apply_login_password_arg(config, args)
 
     if args.workspace_id:
         config.setdefault("workspace", {})["ids"] = args.workspace_id
@@ -337,6 +363,9 @@ def main(argv: list[str] | None = None) -> None:
     p_login_export.add_argument("emails", nargs="+", help="Email address to login and export")
     p_login_export.add_argument("--config", "-c", default=None, help="Config file path")
     p_login_export.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    p_login_export.add_argument("--login-mode", choices=["password", "otp"], default=None, help="Login mode override")
+    p_login_export.add_argument("--password", default=None, help="Password for emails not found in accounts file")
+    p_login_export.add_argument("--workspace-id", action="append", default=None, help="Workspace UUID (repeatable)")
     p_login_export.add_argument("--output", "-o", default=None, help="Output sub2api JSON file")
     p_login_export.add_argument(
         "--accounts",
@@ -353,6 +382,8 @@ def main(argv: list[str] | None = None) -> None:
     p_login_run.add_argument("emails", nargs="+", help="Email address to login, join, and export")
     p_login_run.add_argument("--config", "-c", default=None, help="Config file path")
     p_login_run.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    p_login_run.add_argument("--login-mode", choices=["password", "otp"], default=None, help="Login mode override")
+    p_login_run.add_argument("--password", default=None, help="Password for emails not found in accounts file")
     p_login_run.add_argument("--workspace-id", action="append", default=None, help="Workspace UUID (repeatable)")
     p_login_run.add_argument("--output", "-o", default=None, help="Output sub2api JSON file")
     p_login_run.add_argument(

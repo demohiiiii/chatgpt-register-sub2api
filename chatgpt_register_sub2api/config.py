@@ -24,6 +24,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "mode": "graph",
                 "mailboxes": "",
             },
+            {
+                "type": "gmail",
+                "enable": False,
+                "label": "Gmail Alias",
+                "user": "your@gmail.com",
+                "app_password": "your_app_password",
+                "alias_length": 8,
+                "message_limit": 10,
+            },
         ],
         "request_timeout": 30,
         "wait_timeout": 30,
@@ -36,6 +45,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "registration": {
         "threads": 3,
         "total": 10,
+    },
+    "login": {
+        "mode": "password",
+        "password": "",
     },
     "workspace": {
         "enabled": True,

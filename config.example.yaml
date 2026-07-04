@@ -9,6 +9,15 @@ mail:
       mailboxes: |
         user1@outlook.com----password1----client_id_1----refresh_token_1
         user2@hotmail.com----password2----client_id_2----refresh_token_2
+    - type: gmail
+      enable: false
+      label: Gmail Alias
+      user: your@gmail.com
+      app_password: your_gmail_app_password
+      imap_host: imap.gmail.com
+      imap_port: 993
+      alias_length: 8
+      message_limit: 10
   request_timeout: 30
   wait_timeout: 45
   wait_interval: 3
@@ -20,6 +29,10 @@ proxy:
 registration:
   threads: 3
   total: 10
+
+login:
+  mode: password
+  password: ""
 
 workspace:
   enabled: true

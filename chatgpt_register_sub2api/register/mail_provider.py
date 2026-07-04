@@ -1,10 +1,10 @@
-"""Mail provider for ChatGPT registration — Outlook Token Pool only.
+"""Mail providers for ChatGPT registration and login OTP.
 
-Extracted and simplified from chatgpt2api's mail_provider.py.
-Only the OutlookTokenProvider is included since the user uses Outlook
-token pools exclusively.
+OutlookTokenProvider reads Outlook/Hotmail mailboxes through OAuth tokens.
+GmailProvider reads a Gmail inbox through IMAP App Passwords and can create
+plus-address aliases for registration.
 
-Format: email----password----client_id----refresh_token (one per line)
+Outlook format: email----password----client_id----refresh_token (one per line)
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import imaplib
 import json
 import logging
 import re
+import secrets
+import string
 import time
 from datetime import datetime, timezone
 from email import message_from_bytes, policy
@@ -45,6 +47,8 @@ OUTLOOK_DEFAULT_IMAP_HOST = "outlook.office365.com"
 _outlook_token_state_lock = Lock()
 OUTLOOK_IN_USE_STALE_SECONDS = 3600  # 1 hour stale timeout
 OUTLOOK_UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
+_otp_seen_lock = Lock()
+_otp_seen_cache: dict[str, dict[str, set[str]]] = {}
 
 
 def _load_state() -> dict[str, dict[str, Any]]:
@@ -216,6 +220,9 @@ def _message_tracking_ref(message: dict[str, Any]) -> str:
     """Create a content-based tracking reference for deduplication."""
     provider = str(message.get("provider") or "").strip()
     mailbox = str(message.get("mailbox") or "").strip()
+    imap_uid = str(message.get("imap_uid") or "").strip()
+    if imap_uid:
+        return f"imap:{provider}:{mailbox}:{imap_uid}"
     message_id = str(message.get("message_id") or "").strip()
     if message_id:
         return f"id:{provider}:{mailbox}:{message_id}"
@@ -232,6 +239,54 @@ def _message_tracking_ref(message: dict[str, Any]) -> str:
     )
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
     return f"content:{provider}:{mailbox}:{received_value}:{digest}"
+
+
+def _otp_seen_cache_key(mailbox: dict[str, Any]) -> str:
+    provider = str(mailbox.get("provider") or "").strip().lower()
+    provider_ref = str(mailbox.get("provider_ref") or "").strip().lower()
+    address = str(mailbox.get("address") or "").strip().lower()
+    return f"{provider}:{provider_ref}:{address}"
+
+
+def _mailbox_seen_refs(mailbox: dict[str, Any]) -> set[str]:
+    seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+    if not isinstance(seen_value, list):
+        seen_value = []
+        mailbox["_seen_code_message_refs"] = seen_value
+
+    refs = {str(item) for item in seen_value if str(item)}
+    cache_key = _otp_seen_cache_key(mailbox)
+    with _otp_seen_lock:
+        cached = _otp_seen_cache.get(cache_key, {})
+        refs.update(str(item) for item in cached.get("refs", set()) if str(item))
+    return refs
+
+
+def _remember_seen_code(mailbox: dict[str, Any], ref: str, code: str) -> None:
+    ref = str(ref or "").strip()
+    if not ref:
+        return
+
+    seen_refs = mailbox.setdefault("_seen_code_message_refs", [])
+    if not isinstance(seen_refs, list):
+        seen_refs = []
+        mailbox["_seen_code_message_refs"] = seen_refs
+    if ref and ref not in {str(item) for item in seen_refs}:
+        seen_refs.append(ref)
+
+    cache_key = _otp_seen_cache_key(mailbox)
+    with _otp_seen_lock:
+        cached = _otp_seen_cache.setdefault(cache_key, {"refs": set()})
+        if ref:
+            cached.setdefault("refs", set()).add(ref)
+
+
+def _message_matches_code_filters(mailbox: dict[str, Any], message: dict[str, Any]) -> bool:
+    if str(mailbox.get("provider") or "") == GmailProvider.name:
+        if not _message_targets_address(message, str(mailbox.get("address") or "")):
+            return False
+    subject_include = str(mailbox.get("subject_include") or "").strip().lower()
+    return not subject_include or subject_include in str(message.get("subject") or "").lower()
 
 
 def _message_before_code_boundary(
@@ -270,6 +325,44 @@ def _parse_received_at(value: Any) -> datetime | None:
         return None
 
 
+def _safe_alias_tag(value: str) -> str:
+    tag = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    return tag[:64]
+
+
+def _gmail_base_address(value: str) -> str:
+    email = str(value or "").strip().lower()
+    if "@" not in email:
+        return ""
+    local, domain = email.rsplit("@", 1)
+    return f"{local.split('+', 1)[0]}@{domain}"
+
+
+def _gmail_entry_matches_address(entry: dict, address: str) -> bool:
+    user = str(entry.get("user") or entry.get("email") or "").strip().lower()
+    target = str(address or "").strip().lower()
+    if not user or not target:
+        return False
+    return _gmail_base_address(user) == _gmail_base_address(target)
+
+
+def _message_targets_address(message: dict[str, Any], address: str) -> bool:
+    target = str(address or "").strip().lower()
+    if not target:
+        return True
+    recipients = message.get("recipients")
+    if isinstance(recipients, list):
+        haystack = " ".join(str(item or "") for item in recipients).lower()
+    else:
+        haystack = " ".join(
+            str(message.get(key) or "")
+            for key in ("to", "recipient", "delivered_to", "headers")
+        ).lower()
+    if target in haystack:
+        return True
+    return _gmail_base_address(target) == target and target in haystack
+
+
 # ── Provider classes ────────────────────────────────────────────────
 
 
@@ -293,11 +386,7 @@ class BaseMailProvider:
         raise NotImplementedError
 
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
-        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
-        if not isinstance(seen_value, list):
-            seen_value = []
-            mailbox["_seen_code_message_refs"] = seen_value
-        seen_refs = {str(item) for item in seen_value}
+        seen_refs = _mailbox_seen_refs(mailbox)
 
         deadline = time.monotonic() + self.conf["wait_timeout"]
         while time.monotonic() < deadline:
@@ -307,7 +396,7 @@ class BaseMailProvider:
                 if ref not in seen_refs:
                     code = _extract_code(message)
                     if code:
-                        seen_value.append(ref)
+                        _remember_seen_code(mailbox, ref, code)
                         return code
                     seen_refs.add(ref)
             time.sleep(max(0.2, self.conf["wait_interval"]))
@@ -556,9 +645,9 @@ class OutlookTokenProvider(BaseMailProvider):
                     b"",
                 )
                 if raw_payload:
-                    messages.append(
-                        self._parse_imap_message(mailbox, raw_payload)
-                    )
+                    message = self._parse_imap_message(mailbox, raw_payload)
+                    message["imap_uid"] = uid.decode("utf-8", errors="replace")
+                    messages.append(message)
             return messages
         finally:
             try:
@@ -650,11 +739,7 @@ class OutlookTokenProvider(BaseMailProvider):
 
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
         """Scan recent N messages for verification code, not just the latest."""
-        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
-        if not isinstance(seen_value, list):
-            seen_value = []
-            mailbox["_seen_code_message_refs"] = seen_value
-        seen_refs = {str(item) for item in seen_value}
+        seen_refs = _mailbox_seen_refs(mailbox)
 
         deadline = time.monotonic() + self.conf["wait_timeout"]
         while time.monotonic() < deadline:
@@ -680,10 +765,262 @@ class OutlookTokenProvider(BaseMailProvider):
                         message.get("received_at", ""),
                         code,
                     )
-                    seen_value.append(ref)
+                    _remember_seen_code(mailbox, ref, code)
                     return code
                 seen_refs.add(ref)
             time.sleep(max(0.2, self.conf["wait_interval"]))
+        return None
+
+
+class GmailProvider(BaseMailProvider):
+    """Use a Gmail account and app password to read OpenAI OTP emails.
+
+    Registration creates plus-address aliases from one Gmail inbox:
+    user@gmail.com -> user+randomtag@gmail.com.
+    """
+
+    name = "gmail"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.label = str(entry.get("label") or self.provider_ref)
+        self.user = str(entry.get("user") or entry.get("email") or "").strip()
+        self.app_password = str(entry.get("app_password") or "").replace(" ", "")
+        self.imap_host = str(entry.get("imap_host") or "imap.gmail.com").strip()
+        self.imap_port = int(entry.get("imap_port") or 993)
+        self.imap_timeout = max(1.0, float(conf.get("request_timeout") or 30))
+        self.message_limit = max(1, int(entry.get("message_limit") or 10))
+        self.alias_length = max(4, int(entry.get("alias_length") or 8))
+        self.alias_prefix = str(entry.get("alias_prefix") or "").strip()
+        if not self.user or "@" not in self.user:
+            raise RuntimeError("Gmail provider requires user")
+        if not self.app_password:
+            raise RuntimeError("Gmail provider requires app_password")
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        address = self._alias_address(username)
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "label": self.label,
+            "_credential_email": self.user,
+        }
+
+    def _alias_address(self, username: str | None = None) -> str:
+        local, domain = self.user.rsplit("@", 1)
+        base_local = local.split("+", 1)[0]
+        tag = _safe_alias_tag(username or "")
+        if not tag:
+            alphabet = string.ascii_lowercase + string.digits
+            tag = "".join(secrets.choice(alphabet) for _ in range(self.alias_length))
+        if self.alias_prefix:
+            tag = f"{_safe_alias_tag(self.alias_prefix)}{tag}"
+        return f"{base_local}+{tag}@{domain}"
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        target_address = str(mailbox.get("address") or "").strip()
+        logger.debug(
+            "Gmail IMAP connect: host=%s port=%s timeout=%s user=%s target=%s",
+            self.imap_host,
+            self.imap_port,
+            self.imap_timeout,
+            self.user,
+            target_address,
+        )
+        imap = imaplib.IMAP4_SSL(
+            self.imap_host,
+            self.imap_port,
+            timeout=self.imap_timeout,
+        )
+        try:
+            imap.login(self.user, self.app_password)
+            logger.debug("Gmail IMAP login OK: user=%s", self.user)
+            status, _ = imap.select("INBOX", readonly=True)
+            if status != "OK":
+                raise RuntimeError("Gmail IMAP select INBOX failed")
+            logger.debug("Gmail IMAP select INBOX OK: target=%s", target_address)
+
+            search_query = f'(TO "{target_address}")' if target_address else "ALL"
+            status, data = imap.uid("search", None, search_query)
+            if (status != "OK" or not data or not data[0]) and search_query != "ALL":
+                logger.debug(
+                    "Gmail IMAP target search returned empty: target=%s; falling back to ALL",
+                    target_address,
+                )
+                status, data = imap.uid("search", None, "ALL")
+            if status != "OK" or not data or not data[0]:
+                logger.debug("Gmail IMAP search returned no messages: target=%s", target_address)
+                return []
+            uids = data[0].split()[-self.message_limit :]
+            logger.debug(
+                "Gmail IMAP search OK: target=%s matched=%s fetching=%s",
+                target_address,
+                len(data[0].split()),
+                len(uids),
+            )
+            messages: list[dict[str, Any]] = []
+            for uid in reversed(uids):
+                status, fetched = imap.uid("fetch", uid, "(RFC822)")
+                if status != "OK":
+                    logger.debug("Gmail IMAP fetch skipped: uid=%s status=%s", uid, status)
+                    continue
+                raw_payload = next(
+                    (
+                        part[1]
+                        for part in fetched
+                        if isinstance(part, tuple) and isinstance(part[1], bytes)
+                    ),
+                    b"",
+                )
+                if raw_payload:
+                    message = self._parse_imap_message(mailbox, raw_payload)
+                    message["imap_uid"] = uid.decode("utf-8", errors="replace")
+                    logger.debug(
+                        "Gmail IMAP message candidate: target=%s subject=%s sender=%s "
+                        "recipients=%s received_at=%s",
+                        target_address,
+                        message.get("subject", ""),
+                        message.get("sender", ""),
+                        message.get("recipients", []),
+                        message.get("received_at", ""),
+                    )
+                    messages.append(message)
+            return messages
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
+    def _parse_imap_message(self, mailbox: dict[str, Any], raw: bytes) -> dict[str, Any]:
+        message = message_from_bytes(raw, policy=policy.default)
+        plain: list[str] = []
+        html: list[str] = []
+        for part in message.walk() if message.is_multipart() else [message]:
+            if part.get_content_maintype() == "multipart":
+                continue
+            try:
+                payload = part.get_content()
+            except Exception:
+                continue
+            if not payload:
+                continue
+            if part.get_content_type() == "text/html":
+                html.append(str(payload))
+            else:
+                plain.append(str(payload))
+
+        def _decode(value: str | None) -> str:
+            if not value:
+                return ""
+            try:
+                return str(make_header(decode_header(value)))
+            except Exception:
+                return value
+
+        recipients = [
+            _decode(str(message.get(header) or ""))
+            for header in ("To", "Delivered-To", "X-Original-To", "Envelope-To")
+            if str(message.get(header) or "").strip()
+        ]
+
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": _decode(str(message.get("Message-ID") or "")),
+            "subject": _decode(str(message.get("Subject") or "")),
+            "sender": _decode(str(message.get("From") or "")),
+            "recipients": recipients,
+            "text_content": "\n".join(plain).strip(),
+            "html_content": "\n".join(html).strip(),
+            "received_at": _parse_received_at(str(message.get("Date") or "")),
+            "raw": None,
+        }
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        """Scan recent messages for a code addressed to the target alias."""
+        seen_refs = _mailbox_seen_refs(mailbox)
+
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            remaining = max(0.0, deadline - time.monotonic())
+            logger.debug(
+                "Gmail OTP poll attempt=%s mailbox=%s credential_email=%s remaining=%.1fs",
+                attempt,
+                mailbox.get("address", ""),
+                mailbox.get("_credential_email", ""),
+                remaining,
+            )
+            messages = self.fetch_recent_messages(mailbox)
+            logger.debug(
+                "Gmail OTP poll attempt=%s fetched=%s mailbox=%s",
+                attempt,
+                len(messages),
+                mailbox.get("address", ""),
+            )
+            for message in messages:
+                if _message_before_code_boundary(mailbox, message):
+                    logger.debug(
+                        "Gmail OTP candidate skipped before boundary: subject=%s received_at=%s",
+                        message.get("subject", ""),
+                        message.get("received_at", ""),
+                    )
+                    continue
+                if not _message_targets_address(message, str(mailbox.get("address") or "")):
+                    logger.debug(
+                        "Gmail OTP candidate skipped target mismatch: mailbox=%s recipients=%s subject=%s",
+                        mailbox.get("address", ""),
+                        message.get("recipients", []),
+                        message.get("subject", ""),
+                    )
+                    continue
+                subject_include = str(mailbox.get("subject_include") or "").strip().lower()
+                if subject_include and subject_include not in str(message.get("subject") or "").lower():
+                    logger.debug(
+                        "Gmail OTP candidate skipped subject filter: include=%s subject=%s",
+                        subject_include,
+                        message.get("subject", ""),
+                    )
+                    continue
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs:
+                    logger.debug(
+                        "Gmail OTP candidate skipped already seen: subject=%s received_at=%s",
+                        message.get("subject", ""),
+                        message.get("received_at", ""),
+                    )
+                    continue
+                code = _extract_code(message)
+                if code:
+                    logger.debug(
+                        "Verification code candidate from mailbox=%s "
+                        "credential_email=%s subject=%s sender=%s received_at=%s code=%s",
+                        mailbox.get("address", ""),
+                        mailbox.get("_credential_email", ""),
+                        message.get("subject", ""),
+                        message.get("sender", ""),
+                        message.get("received_at", ""),
+                        code,
+                    )
+                    _remember_seen_code(mailbox, ref, code)
+                    return code
+                logger.debug(
+                    "Gmail OTP candidate had no code: subject=%s sender=%s received_at=%s",
+                    message.get("subject", ""),
+                    message.get("sender", ""),
+                    message.get("received_at", ""),
+                )
+                seen_refs.add(ref)
+            time.sleep(max(0.2, self.conf["wait_interval"]))
+        logger.debug(
+            "Gmail OTP polling timed out: mailbox=%s credential_email=%s attempts=%s",
+            mailbox.get("address", ""),
+            mailbox.get("_credential_email", ""),
+            attempt,
+        )
         return None
 
 
@@ -704,29 +1041,44 @@ def _make_config(mail_config: dict) -> dict:
     }
 
 
-def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
-    """Create a mailbox from the Outlook token pool."""
+def _enabled_provider_entries(mail_config: dict) -> list[dict[str, Any]]:
     providers = (
         mail_config.get("providers")
         if isinstance(mail_config.get("providers"), list)
         else []
     )
-    outlook_entries = [
-        dict(item, provider_ref=f"outlook_token#{i+1}")
-        for i, item in enumerate(providers)
-        if isinstance(item, dict) and item.get("type") == "outlook_token"
-    ]
-    if not outlook_entries:
-        raise RuntimeError(
-            "No outlook_token provider found in mail.providers config"
-        )
+    entries: list[dict[str, Any]] = []
+    for i, item in enumerate(providers):
+        if not isinstance(item, dict) or not item.get("enable", True):
+            continue
+        provider_type = str(item.get("type") or "").strip()
+        if provider_type not in {"outlook_token", "gmail"}:
+            continue
+        entry = dict(item)
+        entry["provider_ref"] = str(entry.get("provider_ref") or f"{provider_type}#{i + 1}")
+        entries.append(entry)
+    return entries
+
+
+def _build_provider(entry: dict[str, Any], conf: dict) -> BaseMailProvider:
+    provider_type = str(entry.get("type") or "").strip()
+    if provider_type == "outlook_token":
+        return OutlookTokenProvider(entry, conf)
+    if provider_type == "gmail":
+        return GmailProvider(entry, conf)
+    raise RuntimeError(f"Unsupported mail provider type: {provider_type}")
+
+
+def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
+    """Create a mailbox from the first enabled provider with capacity."""
+    entries = _enabled_provider_entries(mail_config)
+    if not entries:
+        raise RuntimeError("No enabled mail provider found in mail.providers config")
 
     conf = _make_config(mail_config)
     last_error = ""
-    for entry in outlook_entries:
-        if not entry.get("enable", True):
-            continue
-        provider = OutlookTokenProvider(entry, conf)
+    for entry in entries:
+        provider = _build_provider(entry, conf)
         try:
             mailbox = provider.create_mailbox(username)
             mailbox["_code_not_before"] = datetime.now(timezone.utc)
@@ -735,70 +1087,127 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
             last_error = str(error)
         finally:
             provider.close()
-    raise RuntimeError(last_error or "All Outlook providers exhausted")
+    raise RuntimeError(last_error or "All mail providers exhausted")
+
+
+def mailbox_for_address(mail_config: dict, address: str) -> dict[str, Any]:
+    """Build a mailbox descriptor for an existing email address."""
+    target = str(address or "").strip()
+    if not target:
+        raise RuntimeError("Mailbox address is required")
+
+    for entry in _enabled_provider_entries(mail_config):
+        provider_type = str(entry.get("type") or "")
+        if provider_type == "outlook_token":
+            for credential in parse_outlook_credentials(
+                str(entry.get("mailboxes") or entry.get("pool") or "")
+            ):
+                credential_email = str(credential.get("email") or "").strip()
+                if credential_email.lower() != target.lower():
+                    continue
+                return {
+                    "provider": "outlook_token",
+                    "provider_ref": str(entry.get("provider_ref") or ""),
+                    "address": target,
+                    "label": str(entry.get("label") or ""),
+                    "client_id": credential.get("client_id", ""),
+                    "refresh_token": credential.get("refresh_token", ""),
+                    "_credential_email": credential_email,
+                }
+        elif provider_type == "gmail" and _gmail_entry_matches_address(entry, target):
+            return {
+                "provider": "gmail",
+                "provider_ref": str(entry.get("provider_ref") or ""),
+                "address": target,
+                "label": str(entry.get("label") or ""),
+                "_credential_email": str(entry.get("user") or entry.get("email") or "").strip(),
+            }
+
+    raise RuntimeError(f"No mail provider credentials found for {target}")
+
+
+def _provider_for_mailbox(mail_config: dict, mailbox: dict):
+    entries = _enabled_provider_entries(mail_config)
+    provider_ref = str(mailbox.get("provider_ref") or "")
+    provider_name = str(mailbox.get("provider") or "")
+    address = str(mailbox.get("address") or "").strip().lower()
+
+    entry = next(
+        (item for item in entries if item.get("provider_ref") == provider_ref),
+        None,
+    )
+    if entry is None and address:
+        try:
+            matched = mailbox_for_address(mail_config, address)
+            provider_ref = str(matched.get("provider_ref") or "")
+            provider_name = str(matched.get("provider") or provider_name)
+            mailbox.update({key: value for key, value in matched.items() if value})
+            entry = next(
+                (item for item in entries if item.get("provider_ref") == provider_ref),
+                None,
+            )
+        except RuntimeError as error:
+            if provider_name == OutlookTokenProvider.name or any(
+                item.get("type") == "outlook_token" for item in entries
+            ):
+                raise RuntimeError(
+                    f"No outlook_token mailbox credentials found for {address}"
+                ) from error
+            raise
+    if entry is None and provider_name:
+        entry = next(
+            (item for item in entries if item.get("type") == provider_name),
+            None,
+        )
+    if entry is None:
+        raise RuntimeError(f"No mail provider found (ref={provider_ref})")
+
+    conf = _make_config(mail_config)
+    provider = _build_provider(entry, conf)
+    if str(entry.get("type") or "") == "outlook_token":
+        matched_email = _populate_mailbox_credentials(mailbox, entry)
+    else:
+        matched_email = _populate_gmail_mailbox(mailbox, entry)
+    return provider, entry, matched_email
+
+
+def prime_seen_code_messages(mail_config: dict, mailbox: dict) -> int:
+    """Mark currently visible code emails as seen before requesting a new OTP."""
+    provider, _entry, _matched_email = _provider_for_mailbox(mail_config, mailbox)
+    count = 0
+    try:
+        for message in provider.fetch_recent_messages(mailbox):
+            if not _message_matches_code_filters(mailbox, message):
+                continue
+            code = _extract_code(message)
+            if not code:
+                continue
+            _remember_seen_code(mailbox, _message_tracking_ref(message), code)
+            count += 1
+        logger.debug(
+            "Primed OTP seen cache: mailbox=%s credential_email=%s count=%s",
+            mailbox.get("address", ""),
+            mailbox.get("_credential_email", ""),
+            count,
+        )
+        return count
+    finally:
+        provider.close()
 
 
 def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
-    """Wait for verification code from Outlook mailbox."""
-    providers = (
-        mail_config.get("providers")
-        if isinstance(mail_config.get("providers"), list)
-        else []
-    )
-    provider_ref = str(mailbox.get("provider_ref") or "")
-    address = str(mailbox.get("address") or "").strip().lower()
-
-    # Try matching by provider_ref first, then by mailbox address. When a
-    # concrete address is supplied without credentials, do not fall back to a
-    # different mailbox: that would read the wrong inbox and can return an old
-    # or unrelated OTP.
-    entry = next(
-        (item for item in providers if item.get("provider_ref") == provider_ref),
-        None,
-    )
-    matched_address = False
-    if entry is None and address:
-        entry = next(
-            (
-                item
-                for item in providers
-                if item.get("type") == "outlook_token"
-                and item.get("enable", True)
-                and any(
-                    str(credential.get("email") or "").strip().lower() == address
-                    for credential in parse_outlook_credentials(
-                        str(item.get("mailboxes") or item.get("pool") or "")
-                    )
-                )
-            ),
-            None,
-        )
-        matched_address = entry is not None
-    if (
-        address
-        and not matched_address
-        and not (mailbox.get("client_id") and mailbox.get("refresh_token"))
-    ):
-        raise RuntimeError(
-            f"No outlook_token mailbox credentials found for {address}"
-        )
-    if entry is None:
-        entry = next(
-            (item for item in providers
-             if item.get("type") == "outlook_token" and item.get("enable", True)),
-            None,
-        )
-    if entry is None:
-        raise RuntimeError(
-            f"No outlook_token provider found (ref={provider_ref})"
-        )
-    conf = _make_config(mail_config)
-    provider = OutlookTokenProvider(entry, conf)
+    """Wait for verification code from the mailbox's configured provider."""
+    provider, entry, matched_email = _provider_for_mailbox(mail_config, mailbox)
     try:
-        matched_email = _populate_mailbox_credentials(mailbox, entry)
-        if matched_email:
+        if matched_email and str(entry.get("type") or "") == "outlook_token":
             logger.debug(
                 "Using OutlookToken credentials for mailbox address=%s credential_email=%s",
+                mailbox.get("address", ""),
+                matched_email,
+            )
+        elif matched_email:
+            logger.debug(
+                "Using Gmail credentials for mailbox address=%s credential_email=%s",
                 mailbox.get("address", ""),
                 matched_email,
             )
@@ -828,6 +1237,17 @@ def _populate_mailbox_credentials(mailbox: dict, entry: dict) -> str:
         mailbox["_credential_email"] = credential_email
         return credential_email
     return ""
+
+
+def _populate_gmail_mailbox(mailbox: dict, entry: dict) -> str:
+    credential_email = str(entry.get("user") or entry.get("email") or "").strip()
+    if not credential_email:
+        return ""
+    mailbox.setdefault("provider", GmailProvider.name)
+    mailbox.setdefault("provider_ref", str(entry.get("provider_ref") or ""))
+    mailbox.setdefault("label", str(entry.get("label") or ""))
+    mailbox["_credential_email"] = credential_email
+    return credential_email
 
 
 def mark_mailbox_result(
