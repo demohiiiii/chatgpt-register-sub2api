@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from chatgpt_register_sub2api.pipeline import load_accounts, run_login_export
+from chatgpt_register_sub2api.pipeline import (
+    load_accounts,
+    run_login_export,
+    run_login_join_export,
+)
 
 
 class LoginExportTests(unittest.TestCase):
@@ -141,6 +145,100 @@ class LoginExportTests(unittest.TestCase):
 
             self.assertEqual(summary["exported"], 1)
             self.assertEqual(summary["accounts_file"], str(accounts_file.resolve()))
+
+
+class LoginJoinExportTests(unittest.TestCase):
+    def test_logs_in_joins_refreshes_and_exports_only_successes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            accounts_file = root / "registered_accounts.json"
+            output_file = root / "sub2api.json"
+            accounts_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "email": "ok@example.com",
+                            "password": "pw-ok",
+                            "access_token": "old-access-ok",
+                            "refresh_token": "old-refresh-ok",
+                            "id_token": "old-id-ok",
+                        },
+                        {
+                            "email": "fail@example.com",
+                            "password": "pw-fail",
+                            "access_token": "old-access-fail",
+                            "refresh_token": "old-refresh-fail",
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_login(**kwargs):
+                if kwargs["email"] == "fail@example.com":
+                    raise RuntimeError("login rejected")
+                return {
+                    "email": kwargs["email"],
+                    "access_token": "new-access-ok",
+                    "refresh_token": "new-refresh-ok",
+                    "id_token": "new-id-ok",
+                }
+
+            def fake_join(config, accounts):
+                self.assertEqual([account["email"] for account in accounts], ["ok@example.com"])
+                for account in accounts:
+                    account["join_status"] = "ok"
+                return accounts
+
+            def fake_refresh(config, accounts):
+                self.assertEqual([account["email"] for account in accounts], ["ok@example.com"])
+                for account in accounts:
+                    account["access_token"] = "refreshed-access-ok"
+                    account["refresh_token"] = "refreshed-refresh-ok"
+                    account["plan_type"] = "k12"
+                return accounts
+
+            config = {
+                "_config_dir": str(root),
+                "mail": {},
+                "proxy": {"url": "", "flaresolverr_url": ""},
+                "workspace": {"ids": ["workspace-1"]},
+            }
+
+            with (
+                patch("chatgpt_register_sub2api.pipeline.re_login_for_team_token", side_effect=fake_login),
+                patch("chatgpt_register_sub2api.pipeline.run_join_workspace", side_effect=fake_join),
+                patch("chatgpt_register_sub2api.pipeline.run_refresh_tokens", side_effect=fake_refresh),
+            ):
+                summary = run_login_join_export(
+                    config=config,
+                    emails=["ok@example.com", "fail@example.com"],
+                    output_file=output_file,
+                    accounts_file=accounts_file,
+                )
+
+            self.assertEqual(summary["succeeded"], ["ok@example.com"])
+            self.assertEqual(summary["failed"], [{"email": "fail@example.com", "error": "login rejected"}])
+            self.assertEqual(summary["joined"], 1)
+            self.assertEqual(summary["refreshed"], 1)
+            self.assertEqual(summary["exported"], 1)
+
+            bundle = json.loads(output_file.read_text(encoding="utf-8"))
+            self.assertEqual(len(bundle["accounts"]), 1)
+            self.assertEqual(bundle["accounts"][0]["name"], "ok@example.com")
+            self.assertEqual(
+                bundle["accounts"][0]["credentials"]["access_token"],
+                "refreshed-access-ok",
+            )
+
+            saved_accounts = load_accounts(accounts_file)
+            saved_ok = next(acc for acc in saved_accounts if acc["email"] == "ok@example.com")
+            saved_fail = next(acc for acc in saved_accounts if acc["email"] == "fail@example.com")
+            self.assertEqual(saved_ok["login_join_export_status"], "ok")
+            self.assertEqual(saved_ok["join_status"], "ok")
+            self.assertEqual(saved_ok["plan_type"], "k12")
+            self.assertEqual(saved_fail["login_join_export_status"], "failed")
+            self.assertEqual(saved_fail["access_token"], "old-access-fail")
 
 
 if __name__ == "__main__":

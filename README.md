@@ -40,6 +40,7 @@ chatgpt-register run -n 10 -v
 | `join-workspace` | 只执行 workspace 加入 |
 | `login-team` | 只执行重新登录（team 空间） |
 | `login-export` | 用已有账号重新登录，并只导出登录成功账号 |
+| `login-run` | 用已有账号重新登录、加入 workspace、刷新检查并导出 |
 | `export` | 只导出 sub2api JSON |
 | `run` | 完整流水线（上面四步串行） |
 
@@ -52,6 +53,22 @@ chatgpt-register login-export user1@example.com user2@example.com
 ```
 
 找不到账号、缺少密码或登录失败的邮箱会被提示并跳过，不会使用旧 token 兜底导出。
+
+### 已有账号登录、加入 workspace 并导出
+
+`login-run` 同样从当前目录的 `registered_accounts.json` 读取账号密码，但会在登录成功后继续执行 workspace 加入、token refresh/check 和 sub2api 导出：
+
+```bash
+chatgpt-register login-run user1@example.com user2@example.com
+```
+
+如需临时指定 workspace，可重复传入 `--workspace-id`：
+
+```bash
+chatgpt-register login-run user1@example.com --workspace-id your-k12-workspace-uuid
+```
+
+只有本次登录成功的账号会进入后续流程；登录失败的账号会被提示并跳过，不会使用旧 token。
 
 ## 完整流水线
 

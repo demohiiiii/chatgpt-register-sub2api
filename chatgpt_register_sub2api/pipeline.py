@@ -494,6 +494,122 @@ def run_login_export(
     }
 
 
+def run_login_join_export(
+    config: dict[str, Any],
+    emails: list[str],
+    output_file: Path | None = None,
+    accounts_file: Path | None = None,
+) -> dict[str, Any]:
+    """Login selected existing accounts, join workspace, refresh, and export.
+
+    Passwords are read from registered_accounts.json. Only accounts that
+    successfully complete the fresh login step continue to join/refresh/export.
+    Existing tokens are not used as a fallback for failed logins.
+    """
+    af = Path(accounts_file) if accounts_file else Path("registered_accounts.json")
+    accounts = load_accounts(af)
+    by_email = {
+        _normalize_email(account.get("email")): account
+        for account in accounts
+        if _normalize_email(account.get("email"))
+    }
+
+    requested: list[str] = []
+    seen: set[str] = set()
+    for email in emails:
+        normalized = _normalize_email(email)
+        if normalized and normalized not in seen:
+            requested.append(normalized)
+            seen.add(normalized)
+
+    mail_cfg = config.get("mail", {})
+    proxy_cfg = config.get("proxy", {})
+    proxy = str(proxy_cfg.get("url", "")).strip()
+    flaresolverr_url = str(proxy_cfg.get("flaresolverr_url", "")).strip()
+    workspace_ids = config.get("workspace", {}).get("ids", [])
+    workspace_id = workspace_ids[0] if workspace_ids else ""
+
+    successful_accounts: list[dict[str, Any]] = []
+    succeeded: list[str] = []
+    missing: list[str] = []
+    missing_password: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    logger.info(f"Login-join-export started for {len(requested)} account(s)")
+
+    for email in requested:
+        account = by_email.get(email)
+        if not account:
+            missing.append(email)
+            logger.warning(f"[{email}] Not found in {af}")
+            continue
+
+        password = str(account.get("password") or "")
+        if not password:
+            account["login_join_export_status"] = "missing_password"
+            missing_password.append(email)
+            logger.warning(f"[{email}] Missing password — skipping")
+            continue
+
+        try:
+            tokens = re_login_for_team_token(
+                email=str(account.get("email") or email),
+                password=password,
+                mail_config=mail_cfg,
+                proxy=proxy,
+                flaresolverr_url=flaresolverr_url,
+                workspace_id=workspace_id,
+            )
+        except Exception as e:
+            error = str(e)
+            account["login_join_export_status"] = "failed"
+            account["login_join_export_error"] = error
+            failed.append({"email": email, "error": error})
+            logger.warning(f"[{email}] Login failed: {error}")
+            continue
+
+        account["access_token"] = str(tokens.get("access_token") or "").strip()
+        account["refresh_token"] = str(tokens.get("refresh_token") or "").strip()
+        account["id_token"] = str(tokens.get("id_token") or "").strip()
+        account["login_join_export_status"] = "ok"
+        account.pop("login_join_export_error", None)
+        account["source_type"] = "login_join_export"
+        account["updated_at"] = _now()
+
+        successful_accounts.append(account)
+        succeeded.append(email)
+        logger.info(f"[{email}] Login successful")
+
+    save_accounts(af, accounts)
+
+    if successful_accounts:
+        run_join_workspace(config, successful_accounts)
+        save_accounts(af, accounts)
+        run_refresh_tokens(config, successful_accounts)
+        save_accounts(af, accounts)
+
+    output_path = Path(output_file) if output_file else Path(
+        config.get("_config_dir", ".")
+    ) / f"sub2api-{_timestamp()}.json"
+    _, actual_path = export_sub2api_json(successful_accounts, output_path)
+    logger.info(
+        f"Login-join-export wrote {len(successful_accounts)} account(s) to {actual_path}"
+    )
+
+    return {
+        "requested": requested,
+        "succeeded": succeeded,
+        "missing": missing,
+        "missing_password": missing_password,
+        "failed": failed,
+        "joined": sum(1 for a in successful_accounts if a.get("join_status") == "ok"),
+        "refreshed": sum(1 for a in successful_accounts if a.get("plan_type") == "k12"),
+        "exported": len(successful_accounts),
+        "accounts_file": str(af.resolve()),
+        "output_file": actual_path,
+    }
+
+
 # ── Full pipeline ───────────────────────────────────────────────────
 
 

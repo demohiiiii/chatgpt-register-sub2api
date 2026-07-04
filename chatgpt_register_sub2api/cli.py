@@ -6,6 +6,7 @@ Subcommands:
   join-workspace   Join registered accounts to K12 workspace
   login-team       Re-login with Team space selection
   login-export     Login selected existing accounts and export sub2api JSON
+  login-run        Login selected accounts, join workspace, export sub2api JSON
   export           Export to sub2api JSON
   run              Full pipeline (register → join → login → export)
 """
@@ -28,6 +29,7 @@ from chatgpt_register_sub2api.pipeline import (
     run_export,
     run_full_pipeline,
     run_join_workspace,
+    run_login_join_export,
     run_login_export,
     run_re_login,
     run_register,
@@ -209,6 +211,51 @@ def cmd_login_export(args) -> int:
     return 0 if summary["exported"] > 0 else 1
 
 
+def cmd_login_run(args) -> int:
+    """Login selected accounts, join workspace, refresh, and export."""
+    config = load_config(args.config)
+    setup_logging(config, args.verbose)
+
+    if args.workspace_id:
+        config.setdefault("workspace", {})["ids"] = args.workspace_id
+
+    accounts_file = Path(args.accounts) if args.accounts else Path("registered_accounts.json")
+    output_file = Path(args.output) if args.output else None
+
+    summary = run_login_join_export(
+        config=config,
+        emails=args.emails,
+        output_file=output_file,
+        accounts_file=accounts_file,
+    )
+
+    print(f"\nLogin-run summary:")
+    print(f"  Requested: {len(summary['requested'])}")
+    print(f"  Succeeded: {len(summary['succeeded'])}")
+    print(f"  Joined:    {summary['joined']}")
+    print(f"  K12 Refreshed: {summary['refreshed']}")
+    print(f"  Exported:  {summary['exported']}")
+    print(f"  Output:    {summary['output_file']}")
+    print(f"  Accounts:  {summary['accounts_file']}")
+
+    if summary["missing"]:
+        print("  Not found:")
+        for email in summary["missing"]:
+            print(f"    - {email}")
+
+    if summary["missing_password"]:
+        print("  Missing password:")
+        for email in summary["missing_password"]:
+            print(f"    - {email}")
+
+    if summary["failed"]:
+        print("  Login failed:")
+        for item in summary["failed"]:
+            print(f"    - {item['email']}: {item['error']}")
+
+    return 0 if summary["exported"] > 0 else 1
+
+
 def cmd_run(args) -> int:
     """Run the full pipeline."""
     config = load_config(args.config)
@@ -297,6 +344,23 @@ def main(argv: list[str] | None = None) -> None:
         help="Accounts store JSON file (default: ./registered_accounts.json)",
     )
     p_login_export.set_defaults(func=cmd_login_export)
+
+    # ── login-run ──
+    p_login_run = sub.add_parser(
+        "login-run",
+        help="Login selected accounts, join workspace, and export sub2api JSON",
+    )
+    p_login_run.add_argument("emails", nargs="+", help="Email address to login, join, and export")
+    p_login_run.add_argument("--config", "-c", default=None, help="Config file path")
+    p_login_run.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    p_login_run.add_argument("--workspace-id", action="append", default=None, help="Workspace UUID (repeatable)")
+    p_login_run.add_argument("--output", "-o", default=None, help="Output sub2api JSON file")
+    p_login_run.add_argument(
+        "--accounts",
+        default=None,
+        help="Accounts store JSON file (default: ./registered_accounts.json)",
+    )
+    p_login_run.set_defaults(func=cmd_login_run)
 
     # ── run ──
     p_run = sub.add_parser("run", help="Full pipeline")
